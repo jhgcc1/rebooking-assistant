@@ -1,5 +1,7 @@
 """The rebooking assistant as a LangGraph graph: find the fare rules, check seats, write the answer."""
 
+import random
+import time
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -13,9 +15,23 @@ class State(TypedDict, total=False):
     question: str
     flight: str
     passages: list
+    sources: list
     seats: int | None
     booking_failed: bool
+    attempts: int
     answer: str
+
+
+MAX_BOOKING_ATTEMPTS = 3
+BACKOFF_BASE_SECONDS = 0.2   # wait before the 2nd attempt; doubles each retry
+BACKOFF_MAX_SECONDS = 2.0    # cap on a single wait
+BACKOFF_JITTER = 0.5         # +/- 50% random spread so many clients don't retry in lockstep
+
+
+def backoff_delay(retry_number):
+    """Seconds to wait before retry `retry_number` (1 = first retry): exponential, capped, with jitter."""
+    delay = min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * 2 ** (retry_number - 1))
+    return delay * random.uniform(1 - BACKOFF_JITTER, 1 + BACKOFF_JITTER)
 
 
 def find_rules(state):
@@ -24,14 +40,19 @@ def find_rules(state):
 
 
 def check_seats(state):
+    previous = state.get("attempts", 0)
+    if previous:
+        time.sleep(backoff_delay(previous))
+    attempts = previous + 1
     try:
-        return {"seats": booking.free_seats(state["flight"]), "booking_failed": False}
+        return {"seats": booking.free_seats(state["flight"]), "booking_failed": False, "attempts": attempts}
     except booking.BookingSystemDown:
-        return {"seats": None, "booking_failed": True}
+        return {"seats": None, "booking_failed": True, "attempts": attempts}
 
 
 def after_check_seats(state):
-    if state["booking_failed"]:
+    # Retry while the booking system is down, up to MAX_BOOKING_ATTEMPTS; then answer without seats.
+    if state["booking_failed"] and state["attempts"] < MAX_BOOKING_ATTEMPTS:
         return "check_seats"
     return "write_answer"
 
